@@ -251,7 +251,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         }
 
         for (deferred in deferreds) {
-            val res = deferred.await()
+            val res = try { deferred.await() } catch (_: Throwable) { null }
             if (!res.isNullOrEmpty()) {
                 deferreds.forEach { it.cancel() }
                 return@coroutineScope res
@@ -269,32 +269,40 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = getMetadataExtension().client<TrackClient>().loadFeed(track)
 
-    private suspend fun findTrackInStreamExtension(metaTrack: Track, streamExt: MusicExtension): Track? {
-        val searchClient = try { streamExt.client<SearchFeedClient>() } catch (_: Exception) { return null }
-        val trackClient = try { streamExt.client<TrackClient>() } catch (_: Exception) { return null }
+    private suspend fun findTrackInStreamExtension(metaTrack: Track, streamExt: MusicExtension): Track? = try {
+        val searchClient = try { streamExt.client<SearchFeedClient>() } catch (_: Throwable) { return null }
+        val trackClient = try { streamExt.client<TrackClient>() } catch (_: Throwable) { return null }
 
         val artistName = metaTrack.artists.firstOrNull()?.name ?: ""
         val query = "${metaTrack.title} $artistName".trim()
         if (query.isEmpty()) return null
 
-        val feed = try { searchClient.loadSearchFeed(query) } catch (_: Exception) { return null }
+        val feed = try { searchClient.loadSearchFeed(query) } catch (_: Throwable) { return null }
         
-        val shelves = loadFirstPage(feed.getPagedData(feed.tabs.firstOrNull()).pagedData)
+        val shelves = try {
+            loadFirstPage(feed.getPagedData(feed.tabs.firstOrNull()).pagedData)
+        } catch (_: Throwable) {
+            emptyList()
+        }
         val artistNameLower = artistName.lowercase()
         val trackTitleLower = metaTrack.title.lowercase()
 
+        var foundTrack: Track? = null
         for (shelf in shelves) {
             val candidate = findTrackInShelf(shelf, artistNameLower, trackTitleLower)
             if (candidate != null) {
-                val loaded = try { trackClient.loadTrack(candidate, false) } catch (_: Exception) { null }
+                val loaded = try { trackClient.loadTrack(candidate, false) } catch (_: Throwable) { null }
                 if (loaded != null && loaded.streamables.isNotEmpty()) {
-                    return loaded.copy(streamables = loaded.streamables.map { s ->
+                    foundTrack = loaded.copy(streamables = loaded.streamables.map { s ->
                         s.copy(extras = s.extras + mapOf("stream_ext_id" to streamExt.id))
                     })
+                    break
                 }
             }
         }
-        return null
+        foundTrack
+    } catch (_: Throwable) {
+        null
     }
 
     private fun findTrackInShelf(shelf: Shelf, artistNameLower: String, trackTitleLower: String): Track? {
@@ -317,7 +325,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
                artistNameLower.split(" ").any { part -> part.length > 2 && track.artists.any { it.name.lowercase().contains(part) } }
     }
 
-    private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (_: Exception) { emptyList() }
+    private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (_: Throwable) { emptyList() }
 
     override suspend fun loadAlbum(album: Album): Album = getMetadataExtension().client<AlbumClient>().loadAlbum(album)
     override suspend fun loadTracks(album: Album): Feed<Track>? = getMetadataExtension().client<AlbumClient>().loadTracks(album)
