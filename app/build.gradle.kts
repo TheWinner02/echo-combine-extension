@@ -64,6 +64,8 @@ android {
         applicationId = "dev.brahmkshatriya.echo.extension.$extId"
         minSdk = 24
         targetSdk = 36
+        versionCode = verCode
+        versionName = verName
 
         manifestPlaceholders.apply {
             put("type", "dev.brahmkshatriya.echo.${extType}")
