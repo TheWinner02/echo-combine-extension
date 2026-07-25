@@ -37,6 +37,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     HomeFeedClient, SearchFeedClient, TrackClient,
@@ -55,6 +56,16 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     override fun setSettings(settings: Settings) {
         this.settings = settings
+    }
+
+    private fun getSettingString(key: String): String? {
+        if (!::settings.isInitialized) return null
+        return runCatching { settings.getString(key) }.getOrNull()
+    }
+
+    private fun getSettingBoolean(key: String): Boolean? {
+        if (!::settings.isInitialized) return null
+        return runCatching { settings.getBoolean(key) }.getOrNull()
     }
 
     override suspend fun getSettingItems(): List<Setting> {
@@ -93,7 +104,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         var lastKey = KEY_STREAM_EXT
         val suffixes = listOf("2nd", "3rd", "4th", "5th")
         for (i in suffixes.indices) {
-            val value = runCatching { settings.getString(lastKey) }.getOrNull()
+            val value = getSettingString(lastKey)
             if (value != null && value != "none") {
                 val currentKey = "${KEY_STREAM_EXT}_${i + 1}"
                 settingsList.add(
@@ -125,8 +136,13 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         extensionsFlow.value = extensions.filter { it.id != COMBINE_ID }
     }
 
-    private suspend fun awaitExtensions(): List<MusicExtension> =
-        extensionsFlow.first { it != null }!!
+    private suspend fun awaitExtensions(): List<MusicExtension> {
+        val current = extensionsFlow.value
+        if (current != null) return current
+        return withTimeoutOrNull(3000) {
+            extensionsFlow.first { it != null }
+        } ?: emptyList()
+    }
 
     private suspend fun getMetadataExtension(): MusicExtension {
         return getSelectedExtension(KEY_METADATA_EXT)
@@ -134,48 +150,50 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     private suspend fun getStreamExtensions(): List<MusicExtension> {
         val exts = awaitExtensions()
+        if (exts.isEmpty()) return emptyList()
         val result = mutableListOf<MusicExtension>()
-        val metaExt = getMetadataExtension()
+        val metaExt = runCatching { getMetadataExtension() }.getOrNull()
 
         fun findExt(id: String?): MusicExtension? {
-            if (id == null || id == "none") return null
+            if (id.isNullOrEmpty() || id == "none") return null
             return exts.find { it.id == id || it.name == id }
         }
 
-        // Migration
-        val selectedSet = runCatching { settings.getStringSet(KEY_STREAM_EXT) }.getOrNull()
+        // Legacy Migration
+        val selectedSet = if (::settings.isInitialized) runCatching { settings.getStringSet(KEY_STREAM_EXT) }.getOrNull() else null
         if (!selectedSet.isNullOrEmpty()) {
             return exts.filter { it.id in selectedSet }
         }
 
-        // Priority Chain: Preferred -> 2nd -> ...
-        findExt(runCatching { settings.getString(KEY_STREAM_EXT) }.getOrNull())?.let { result.add(it) }
+        // Priority Chain: Preferred -> 2nd -> 3rd ...
+        val preferredId = getSettingString(KEY_STREAM_EXT)
+        val preferred = findExt(preferredId) ?: exts.firstOrNull()
+        preferred?.let { result.add(it) }
+
         for (i in 1..5) {
-            val id = runCatching { settings.getString("${KEY_STREAM_EXT}_$i") }.getOrNull()
+            val id = getSettingString("${KEY_STREAM_EXT}_$i")
             findExt(id)?.let { result.add(it) } ?: break
         }
 
-        if (result.none { it.id == metaExt.id }) {
+        if (metaExt != null && result.none { it.id == metaExt.id }) {
             result.add(metaExt)
         }
 
-        if (result.isEmpty() && exts.isNotEmpty()) {
-            result.add(exts.first())
-        }
         return result.distinctBy { it.id }
     }
 
     private suspend fun getSelectedExtension(key: String): MusicExtension {
         val exts = awaitExtensions()
-        val selectedValue = runCatching { settings.getString(key) }.getOrNull()
+        if (exts.isEmpty()) throw Exception("No music extensions installed")
+        val selectedValue = getSettingString(key)
 
         if (selectedValue == null) {
-            val setValues = runCatching { settings.getStringSet(key) }.getOrNull()
+            val setValues = if (::settings.isInitialized) runCatching { settings.getStringSet(key) }.getOrNull() else null
             if (!setValues.isNullOrEmpty()) {
                 val match = exts.find { it.id in setValues }
                 if (match != null) return match
             }
-            return exts.firstOrNull() ?: throw Exception("No music extensions installed")
+            return exts.first()
         }
 
         val match = exts.find { it.id == selectedValue || it.name == selectedValue }
@@ -186,12 +204,13 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
             return exts[index]
         }
 
-        return exts.firstOrNull() ?: throw Exception("No music extensions installed")
+        return exts.first()
     }
 
     @Suppress("UNCHECKED_CAST")
     private suspend inline fun <reified T> MusicExtension.client(): T {
-        return instance.value().getOrThrow() as T
+        val inst = instance.value().getOrNull() ?: throw Exception("Extension '${name}' failed to initialize")
+        return inst as? T ?: throw Exception("Extension '${name}' does not support ${T::class.simpleName}")
     }
 
     private suspend inline fun <reified T> MusicExtension.clientOrNull(): T? {
@@ -214,22 +233,31 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val metaTrack = metaClient.loadTrack(track, isDownload)
 
         val streamExts = getStreamExtensions()
-        val isFirstAvailable = settings.getBoolean(KEY_FIRST_AVAILABLE) == true
+        val isFirstAvailable = getSettingBoolean(KEY_FIRST_AVAILABLE) == true
 
         val allStreamables = if (isFirstAvailable) {
             selectFirstFound(metaTrack, streamExts, metaExt) ?: metaTrack.streamables
         } else {
             coroutineScope {
                 val deferreds = streamExts.mapIndexed { index, ext ->
-                    // huge priority shift: preferred = 100000000 bonus. do better
-                    val priorityBonus = (streamExts.size - index) * 10_000_000
-                    if (ext.id == metaExt.id) {
-                        async { metaTrack.streamables.map { it.copy(quality = it.quality + priorityBonus) } }
-                    } else {
-                        async { findTrackInStreamExtension(metaTrack, ext)?.streamables?.map { it.copy(quality = it.quality + priorityBonus) } ?: emptyList() }
+                    async {
+                        val streamables = if (ext.id == metaExt.id) {
+                            metaTrack.streamables
+                        } else {
+                            findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
+                        }
+                        streamables.map { s ->
+                            val existingExtras = s.extras
+                            val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to ext.id)
+                            s.copy(extras = updatedExtras) to index
+                        }
                     }
                 }
-                deferreds.awaitAll().flatten().sortedByDescending { it.quality }.map { it }
+                deferreds.awaitAll()
+                    .flatten()
+                    .sortedWith(compareBy<Pair<Streamable, Int>> { it.second }.thenByDescending { it.first.quality })
+                    .map { it.first }
+                    .distinctBy { it.id }
             }
         }
 
@@ -264,23 +292,33 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val streamExtId = streamable.extras["stream_ext_id"]
         val exts = awaitExtensions()
         val ext = if (streamExtId != null) exts.find { it.id == streamExtId } else getMetadataExtension()
-        return ext?.client<TrackClient>()?.loadStreamableMedia(streamable, isDownload) ?: throw Exception("Extension not found")
+        return ext?.client<TrackClient>()?.loadStreamableMedia(streamable, isDownload)
+            ?: throw Exception("Extension '${streamExtId ?: "metadata"}' not found or not supporting playback")
     }
 
-    override suspend fun loadFeed(track: Track): Feed<Shelf>? = getMetadataExtension().client<TrackClient>().loadFeed(track)
+    override suspend fun loadFeed(track: Track): Feed<Shelf>? = getMetadataExtension().clientOrNull<TrackClient>()?.loadFeed(track)
 
     private suspend fun findTrackInStreamExtension(metaTrack: Track, streamExt: MusicExtension): Track? = try {
-        val searchClient = try { streamExt.client<SearchFeedClient>() } catch (_: Throwable) { return null }
-        val trackClient = try { streamExt.client<TrackClient>() } catch (_: Throwable) { return null }
+        val searchClient = streamExt.clientOrNull<SearchFeedClient>() ?: return null
+        val trackClient = streamExt.clientOrNull<TrackClient>() ?: return null
 
         val artistName = metaTrack.artists.firstOrNull()?.name ?: ""
         val query = "${metaTrack.title} $artistName".trim()
         if (query.isEmpty()) return null
 
-        val feed = try { searchClient.loadSearchFeed(query) } catch (_: Throwable) { return null }
-        
+        val feed = try {
+            withTimeoutOrNull(5000) {
+                searchClient.loadSearchFeed(query)
+            } ?: return null
+        } catch (_: Throwable) { return null }
+
+        val targetTab = feed.tabs.find { tab ->
+            val tabTitle = tab.title.lowercase()
+            tabTitle.contains("song") || tabTitle.contains("track") || tabTitle.contains("single")
+        } ?: feed.tabs.firstOrNull()
+
         val shelves = try {
-            loadFirstPage(feed.getPagedData(feed.tabs.firstOrNull()).pagedData)
+            loadFirstPage(feed.getPagedData(targetTab).pagedData)
         } catch (_: Throwable) {
             emptyList()
         }
@@ -291,10 +329,17 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         for (shelf in shelves) {
             val candidate = findTrackInShelf(shelf, artistNameLower, trackTitleLower)
             if (candidate != null) {
-                val loaded = try { trackClient.loadTrack(candidate, false) } catch (_: Throwable) { null }
+                val loaded = try {
+                    withTimeoutOrNull(5000) {
+                        trackClient.loadTrack(candidate, false)
+                    }
+                } catch (_: Throwable) { null }
+
                 if (loaded != null && loaded.streamables.isNotEmpty()) {
                     foundTrack = loaded.copy(streamables = loaded.streamables.map { s ->
-                        s.copy(extras = s.extras + mapOf("stream_ext_id" to streamExt.id))
+                        val existingExtras = s.extras
+                        val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
+                        s.copy(extras = updatedExtras)
                     })
                     break
                 }
@@ -318,40 +363,61 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     }
 
     private fun matches(track: Track, artistNameLower: String, trackTitleLower: String): Boolean {
-        val titleMatch = track.title.lowercase().contains(trackTitleLower) || trackTitleLower.contains(track.title.lowercase())
+        val candidateTitle = cleanTitle(track.title)
+        val targetTitle = cleanTitle(trackTitleLower)
+
+        val titleMatch = when {
+            candidateTitle == targetTitle -> true
+            targetTitle.length > 3 && candidateTitle.contains(targetTitle) -> true
+            candidateTitle.length > 3 && targetTitle.contains(candidateTitle) -> true
+            else -> false
+        }
         if (!titleMatch) return false
         if (artistNameLower.isEmpty()) return true
-        return track.artists.any { it.name.lowercase().contains(artistNameLower) } ||
-               artistNameLower.split(" ").any { part -> part.length > 2 && track.artists.any { it.name.lowercase().contains(part) } }
+
+        val candidateArtists = track.artists.map { cleanTitle(it.name) }
+        val targetArtistClean = cleanTitle(artistNameLower)
+
+        val artistMatch = candidateArtists.any { it.contains(targetArtistClean) || targetArtistClean.contains(it) } ||
+                targetArtistClean.split(" ").filter { it.length > 2 }.any { part -> candidateArtists.any { it.contains(part) } }
+
+        return artistMatch
+    }
+
+    private fun cleanTitle(title: String): String {
+        return title.lowercase()
+            .replace(Regex("\\(.*\\)|\\[.*\\]"), "")
+            .replace(Regex("[^a-z0-9\\s]"), "")
+            .trim()
     }
 
     private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (_: Throwable) { emptyList() }
 
     override suspend fun loadAlbum(album: Album): Album = getMetadataExtension().client<AlbumClient>().loadAlbum(album)
-    override suspend fun loadTracks(album: Album): Feed<Track>? = getMetadataExtension().client<AlbumClient>().loadTracks(album)
-    override suspend fun loadFeed(album: Album): Feed<Shelf>? = getMetadataExtension().client<AlbumClient>().loadFeed(album)
+    override suspend fun loadTracks(album: Album): Feed<Track>? = getMetadataExtension().clientOrNull<AlbumClient>()?.loadTracks(album)
+    override suspend fun loadFeed(album: Album): Feed<Shelf>? = getMetadataExtension().clientOrNull<AlbumClient>()?.loadFeed(album)
     override suspend fun loadArtist(artist: Artist): Artist = getMetadataExtension().client<ArtistClient>().loadArtist(artist)
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> = getMetadataExtension().client<ArtistClient>().loadFeed(artist)
     override suspend fun loadPlaylist(playlist: Playlist): Playlist = getMetadataExtension().client<PlaylistClient>().loadPlaylist(playlist)
     override suspend fun loadTracks(playlist: Playlist): Feed<Track> = getMetadataExtension().client<PlaylistClient>().loadTracks(playlist)
-    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = getMetadataExtension().client<PlaylistClient>().loadFeed(playlist)
+    override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = getMetadataExtension().clientOrNull<PlaylistClient>()?.loadFeed(playlist)
     override suspend fun listEditablePlaylists(track: Track?): List<Pair<Playlist, Boolean>> = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.listEditablePlaylists(track) ?: emptyList()
     override suspend fun createPlaylist(title: String, description: String?): Playlist = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.createPlaylist(title, description) ?: throw Exception("Not supported")
     override suspend fun addTracksToPlaylist(playlist: Playlist, tracks: List<Track>, position: Int, previousTracks: List<Track>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.addTracksToPlaylist(playlist, tracks, position, previousTracks) ?: throw Exception("Not supported")
-    override suspend fun removeTracksFromPlaylist(playlist: Playlist, tracks: List<Track>, indexes: List<Int>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.removeTracksFromPlaylist(playlist, tracks, indexes) ?: throw Exception("Not supported")
-    override suspend fun moveTrackInPlaylist(playlist: Playlist, tracks: List<Track>, fromPosition: Int, toPosition: Int) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.moveTrackInPlaylist(playlist, tracks, fromPosition, toPosition) ?: throw Exception("Not supported")
+    override suspend fun removeTracksFromPlaylist(playlist: Playlist, tracks: List<Track>, index: List<Int>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.removeTracksFromPlaylist(playlist, tracks, index) ?: throw Exception("Not supported")
+    override suspend fun moveTrackInPlaylist(playlist: Playlist, tracks: List<Track>, fromIndex: Int, toIndex: Int) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.moveTrackInPlaylist(playlist, tracks, fromIndex, toIndex) ?: throw Exception("Not supported")
     override suspend fun editPlaylistMetadata(playlist: Playlist, title: String, description: String?) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.editPlaylistMetadata(playlist, title, description) ?: throw Exception("Not supported")
     override suspend fun deletePlaylist(playlist: Playlist) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.deletePlaylist(playlist) ?: throw Exception("Not supported")
     override suspend fun isItemSaved(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<SaveClient>()?.isItemSaved(item) ?: false
-    override suspend fun saveToLibrary(item: EchoMediaItem, isSave: Boolean) = getMetadataExtension().clientOrNull<SaveClient>()?.saveToLibrary(item, isSave) ?: throw Exception("Not supported")
+    override suspend fun saveToLibrary(item: EchoMediaItem, shouldSave: Boolean) = getMetadataExtension().clientOrNull<SaveClient>()?.saveToLibrary(item, shouldSave) ?: throw Exception("Not supported")
     override suspend fun isItemLiked(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<LikeClient>()?.isItemLiked(item) ?: false
-    override suspend fun likeItem(item: EchoMediaItem, isLike: Boolean) = getMetadataExtension().clientOrNull<LikeClient>()?.likeItem(item, isLike) ?: throw Exception("Not supported")
+    override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) = getMetadataExtension().clientOrNull<LikeClient>()?.likeItem(item, shouldLike) ?: throw Exception("Not supported")
     override suspend fun onShare(item: EchoMediaItem): String = getMetadataExtension().clientOrNull<ShareClient>()?.onShare(item) ?: throw Exception("Not supported")
     override suspend fun isFollowing(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<FollowClient>()?.isFollowing(item) ?: false
-    override suspend fun followItem(item: EchoMediaItem, isFollow: Boolean) = getMetadataExtension().clientOrNull<FollowClient>()?.followItem(item, isFollow) ?: throw Exception("Not supported")
+    override suspend fun followItem(item: EchoMediaItem, shouldFollow: Boolean) = getMetadataExtension().clientOrNull<FollowClient>()?.followItem(item, shouldFollow) ?: throw Exception("Not supported")
     override suspend fun getFollowersCount(item: EchoMediaItem): Long? = getMetadataExtension().clientOrNull<FollowClient>()?.getFollowersCount(item)
     override suspend fun isItemHidden(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<HideClient>()?.isItemHidden(item) ?: false
-    override suspend fun hideItem(item: EchoMediaItem, isHide: Boolean) = getMetadataExtension().clientOrNull<HideClient>()?.hideItem(item, isHide) ?: throw Exception("Not supported")
+    override suspend fun hideItem(item: EchoMediaItem, shouldHide: Boolean) = getMetadataExtension().clientOrNull<HideClient>()?.hideItem(item, shouldHide) ?: throw Exception("Not supported")
     override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.radio(item, context) ?: throw Exception("Not supported")
     override suspend fun loadRadio(radio: Radio): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.loadRadio(radio) ?: throw Exception("Not supported")
     override suspend fun loadTracks(radio: Radio): Feed<Track> = getMetadataExtension().clientOrNull<RadioClient>()?.loadTracks(radio) ?: throw Exception("Not supported")
