@@ -230,7 +230,12 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
         val metaExt = getMetadataExtension()
         val metaClient = metaExt.client<TrackClient>()
-        val metaTrack = metaClient.loadTrack(track, isDownload)
+        val metaTrack = try {
+            metaClient.loadTrack(track, isDownload)
+        } catch (e: Throwable) {
+            println("CombineExtension: Metadata extension failed to load track: ${e.message}")
+            track
+        }
 
         val streamExts = getStreamExtensions()
         val isFirstAvailable = getSettingBoolean(KEY_FIRST_AVAILABLE) == true
