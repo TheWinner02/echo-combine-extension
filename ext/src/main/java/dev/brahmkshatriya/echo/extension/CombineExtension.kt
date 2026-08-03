@@ -249,7 +249,12 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
                         val streamables = if (ext.id == metaExt.id) {
                             metaTrack.streamables
                         } else {
-                            findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
+                            try {
+                                findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
+                            } catch (e: Throwable) {
+                                println("CombineExtension: Extension ${ext.id} failed to find track: ${e.message}")
+                                emptyList()
+                            }
                         }
                         streamables.map { s ->
                             val existingExtras = s.extras
@@ -279,7 +284,14 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
             if (ext.id == metaExt.id) {
                 async { metaTrack.streamables.ifEmpty { null } }
             } else {
-                async { findTrackInStreamExtension(metaTrack, ext)?.streamables?.ifEmpty { null } }
+                async {
+                    try {
+                        findTrackInStreamExtension(metaTrack, ext)?.streamables?.ifEmpty { null }
+                    } catch (e: Throwable) {
+                        println("CombineExtension: Extension ${ext.id} failed in selectFirstFound: ${e.message}")
+                        null
+                    }
+                }
             }
         }
 
