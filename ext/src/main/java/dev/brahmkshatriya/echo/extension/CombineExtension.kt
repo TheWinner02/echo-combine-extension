@@ -238,71 +238,45 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         }
 
         val streamExts = getStreamExtensions()
-        val isFirstAvailable = getSettingBoolean(KEY_FIRST_AVAILABLE) == true
 
-        val allStreamables = if (isFirstAvailable) {
-            selectFirstFound(metaTrack, streamExts, metaExt) ?: metaTrack.streamables
-        } else {
-            coroutineScope {
-                val deferreds = streamExts.mapIndexed { index, ext ->
-                    async {
-                        val streamables = if (ext.id == metaExt.id) {
-                            metaTrack.streamables
-                        } else {
-                            try {
-                                findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
-                            } catch (e: Throwable) {
-                                println("CombineExtension: Extension ${ext.id} failed to find track: ${e.message}")
-                                emptyList()
-                            }
-                        }
-                        streamables.map { s ->
-                            val existingExtras = s.extras
-                            val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to ext.id)
-                            s.copy(extras = updatedExtras) to index
+        val allStreamables = coroutineScope {
+            val deferreds = streamExts.mapIndexed { index, ext ->
+                async {
+                    val streamables = if (ext.id == metaExt.id) {
+                        metaTrack.streamables
+                    } else {
+                        try {
+                            findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
+                        } catch (e: Throwable) {
+                            println("CombineExtension: Extension ${ext.id} failed to find track: ${e.message}")
+                            emptyList()
                         }
                     }
+                    streamables.map { s ->
+                        val existingExtras = s.extras
+                        val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to ext.id)
+                        val titleWithExt = if (s.title != null) {
+                            if (s.title!!.startsWith(ext.name)) s.title
+                            else "${ext.name} • ${s.title}"
+                        } else {
+                            if (s.quality > 1) "${ext.name} • ${s.quality} kbps"
+                            else "${ext.name} (Auto)"
+                        }
+                        s.copy(title = titleWithExt, extras = updatedExtras) to index
+                    }
                 }
-                deferreds.awaitAll()
-                    .flatten()
-                    .sortedWith(compareBy<Pair<Streamable, Int>> { it.second }.thenByDescending { it.first.quality })
+            }
+            val results = deferreds.awaitAll().flatten()
+            if (results.isEmpty()) {
+                metaTrack.streamables
+            } else {
+                results.sortedWith(compareByDescending<Pair<Streamable, Int>> { it.first.quality }.thenBy { it.second })
                     .map { it.first }
                     .distinctBy { it.id }
             }
         }
 
         return metaTrack.copy(streamables = allStreamables)
-    }
-
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private suspend fun selectFirstFound(
-        metaTrack: Track,
-        exts: List<MusicExtension>,
-        metaExt: MusicExtension
-    ): List<Streamable>? = coroutineScope {
-        val deferreds = exts.map { ext ->
-            if (ext.id == metaExt.id) {
-                async { metaTrack.streamables.ifEmpty { null } }
-            } else {
-                async {
-                    try {
-                        findTrackInStreamExtension(metaTrack, ext)?.streamables?.ifEmpty { null }
-                    } catch (e: Throwable) {
-                        println("CombineExtension: Extension ${ext.id} failed in selectFirstFound: ${e.message}")
-                        null
-                    }
-                }
-            }
-        }
-
-        for (deferred in deferreds) {
-            val res = try { deferred.await() } catch (_: Throwable) { null }
-            if (!res.isNullOrEmpty()) {
-                deferreds.forEach { it.cancel() }
-                return@coroutineScope res
-            }
-        }
-        null
     }
 
     override suspend fun loadStreamableMedia(streamable: Streamable, isDownload: Boolean): Streamable.Media {
