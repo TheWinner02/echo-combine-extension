@@ -313,66 +313,130 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         } catch (_: Throwable) {
             emptyList()
         }
-        val artistNameLower = artistName.lowercase()
-        val trackTitleLower = metaTrack.title.lowercase()
 
-        var foundTrack: Track? = null
+        val allCandidates = mutableListOf<Track>()
         for (shelf in shelves) {
-            val candidate = findTrackInShelf(shelf, artistNameLower, trackTitleLower)
-            if (candidate != null) {
-                val loaded = try {
-                    withTimeoutOrNull(5000) {
-                        trackClient.loadTrack(candidate, false)
-                    }
-                } catch (_: Throwable) { null }
-
-                if (loaded != null && loaded.streamables.isNotEmpty()) {
-                    foundTrack = loaded.copy(streamables = loaded.streamables.map { s ->
-                        val existingExtras = s.extras
-                        val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
-                        s.copy(extras = updatedExtras)
-                    })
-                    break
+            when (shelf) {
+                is Shelf.Item -> {
+                    (shelf.media as? Track)?.let { allCandidates.add(it) }
                 }
+                is Shelf.Lists.Tracks -> allCandidates.addAll(shelf.list)
+                is Shelf.Lists.Items -> allCandidates.addAll(shelf.list.mapNotNull { it as? Track })
+                else -> {}
             }
         }
-        foundTrack
+
+        val scoredCandidates = allCandidates.mapNotNull { candidate ->
+            val score = scoreMatch(metaTrack, candidate)
+            if (score > 30.0) candidate to score else null
+        }.sortedByDescending { it.second }
+
+        for ((candidate, _) in scoredCandidates) {
+            val loaded = try {
+                withTimeoutOrNull(5000) {
+                    trackClient.loadTrack(candidate, false)
+                }
+            } catch (_: Throwable) { null }
+
+            if (loaded != null && loaded.streamables.isNotEmpty()) {
+                return loaded.copy(streamables = loaded.streamables.map { s ->
+                    val existingExtras = s.extras
+                    val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
+                    s.copy(extras = updatedExtras)
+                })
+            }
+        }
+        null
     } catch (_: Throwable) {
         null
     }
 
-    private fun findTrackInShelf(shelf: Shelf, artistNameLower: String, trackTitleLower: String): Track? {
-        return when (shelf) {
-            is Shelf.Item -> {
-                val media = shelf.media
-                if (media is Track && matches(media, artistNameLower, trackTitleLower)) media else null
+    private fun scoreMatch(target: Track, candidate: Track): Double {
+        if (!target.isrc.isNullOrBlank() && !candidate.isrc.isNullOrBlank() && target.isrc.equals(candidate.isrc, ignoreCase = true)) {
+            return 1000.0
+        }
+
+        val targetRawTitle = target.title.lowercase().trim()
+        val candidateRawTitle = candidate.title.lowercase().trim()
+
+        val targetClean = cleanTitle(target.title)
+        val candidateClean = cleanTitle(candidate.title)
+
+        if (targetClean.isEmpty() || candidateClean.isEmpty()) return 0.0
+
+        val versionModifiers = listOf(
+            "remix", "live", "acoustic", "instrumental", "karaoke",
+            "cover", "slowed", "reverb", "speed up", "sped up", "nightcore",
+            "radio edit", "extended", "club mix", "dub", "tribute", "parody"
+        )
+
+        val targetModifiers = versionModifiers.filter { targetRawTitle.contains(it) }
+        val candidateModifiers = versionModifiers.filter { candidateRawTitle.contains(it) }
+
+        val extraModifiersInCandidate = candidateModifiers.filter { !targetModifiers.contains(it) }
+        if (extraModifiersInCandidate.isNotEmpty()) {
+            return 0.0
+        }
+
+        val missingModifiersInCandidate = targetModifiers.filter { !candidateModifiers.contains(it) }
+        if (missingModifiersInCandidate.isNotEmpty()) {
+            return 10.0
+        }
+
+        var score = 0.0
+
+        if (targetRawTitle == candidateRawTitle) {
+            score += 80.0
+        } else if (targetClean == candidateClean) {
+            score += 60.0
+        } else if (candidateClean.startsWith(targetClean) || targetClean.startsWith(candidateClean)) {
+            score += 40.0
+        } else if (candidateClean.contains(targetClean) || targetClean.contains(candidateClean)) {
+            score += 30.0
+        } else {
+            val targetWords = targetClean.split(" ").filter { it.length > 1 }.toSet()
+            val candidateWords = candidateClean.split(" ").filter { it.length > 1 }.toSet()
+            val commonWords = targetWords.intersect(candidateWords)
+            if (commonWords.isEmpty()) return 0.0
+            val overlapRatio = (commonWords.size.toDouble() * 2) / (targetWords.size + candidateWords.size)
+            if (overlapRatio < 0.5) return 0.0
+            score += (overlapRatio * 35.0)
+        }
+
+        val targetArtistClean = cleanTitle(target.artists.firstOrNull()?.name ?: "")
+        val candidateArtistsClean = candidate.artists.map { cleanTitle(it.name) }
+
+        if (targetArtistClean.isNotEmpty()) {
+            val directArtistMatch = candidateArtistsClean.any { it.contains(targetArtistClean) || targetArtistClean.contains(it) }
+            val inCandidateTitle = candidateClean.contains(targetArtistClean)
+            if (directArtistMatch) {
+                score += 30.0
+            } else if (inCandidateTitle) {
+                score += 20.0
+            } else {
+                val targetArtistWords = targetArtistClean.split(" ").filter { it.length > 2 }
+                val anyWordMatch = targetArtistWords.any { word -> candidateArtistsClean.any { it.contains(word) } || candidateClean.contains(word) }
+                if (anyWordMatch) {
+                    score += 15.0
+                } else {
+                    return 0.0
+                }
             }
-            is Shelf.Lists.Tracks -> shelf.list.firstOrNull { matches(it, artistNameLower, trackTitleLower) }
-            is Shelf.Lists.Items -> shelf.list.mapNotNull { item -> item as? Track }.firstOrNull { matches(it, artistNameLower, trackTitleLower) }
-            else -> null
         }
-    }
 
-    private fun matches(track: Track, artistNameLower: String, trackTitleLower: String): Boolean {
-        val candidateTitle = cleanTitle(track.title)
-        val targetTitle = cleanTitle(trackTitleLower)
-
-        val titleMatch = when {
-            candidateTitle == targetTitle -> true
-            targetTitle.length > 3 && candidateTitle.contains(targetTitle) -> true
-            candidateTitle.length > 3 && targetTitle.contains(candidateTitle) -> true
-            else -> false
+        val targetDuration = target.duration
+        val candidateDuration = candidate.duration
+        if (targetDuration != null && targetDuration > 0 && candidateDuration != null && candidateDuration > 0) {
+            val diffSec = kotlin.math.abs(targetDuration - candidateDuration) / 1000
+            when {
+                diffSec <= 3 -> score += 25.0
+                diffSec <= 7 -> score += 15.0
+                diffSec <= 15 -> score += 5.0
+                diffSec > 45 -> score -= 40.0
+            }
         }
-        if (!titleMatch) return false
-        if (artistNameLower.isEmpty()) return true
 
-        val candidateArtists = track.artists.map { cleanTitle(it.name) }
-        val targetArtistClean = cleanTitle(artistNameLower)
-
-        val artistMatch = candidateArtists.any { it.contains(targetArtistClean) || targetArtistClean.contains(it) } ||
-                targetArtistClean.split(" ").filter { it.length > 2 }.any { part -> candidateArtists.any { it.contains(part) } }
-
-        return artistMatch
+        return score
     }
 
     private fun cleanTitle(title: String): String {
