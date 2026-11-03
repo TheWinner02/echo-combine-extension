@@ -31,6 +31,9 @@ import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingList
 import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -133,7 +136,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     private val extensionsFlow = MutableStateFlow<List<MusicExtension>?>(null)
 
     override fun setMusicExtensions(extensions: List<MusicExtension>) {
-        extensionsFlow.value = extensions.filter { it.id != COMBINE_ID }
+        extensionsFlow.value = extensions.filter { it.id != COMBINE_ID && it.isEnabled }
     }
 
     private suspend fun awaitExtensions(): List<MusicExtension> {
@@ -229,25 +232,45 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     override suspend fun loadTrack(track: Track, isDownload: Boolean): Track {
         val metaExt = getMetadataExtension()
+        val originalCatalog = track.extras[RememberedSource.CATALOG]
+        check(originalCatalog == null || originalCatalog == metaExt.id) {
+            "Metadata source changed. Reopen this song from the current catalogue."
+        }
         val metaClient = metaExt.client<TrackClient>()
         val metaTrack = try {
             metaClient.loadTrack(track, isDownload)
-        } catch (e: Throwable) {
+        } catch (cancel: CancellationException) { throw cancel }
+        catch (e: Throwable) {
             println("CombineExtension: Metadata extension failed to load track: ${e.message}")
             track
         }
 
         val streamExts = getStreamExtensions()
+        val remembered = RememberedSource.choice(track, metaExt.id)
 
         val allStreamables = coroutineScope {
             val deferreds = streamExts.mapIndexed { index, ext ->
                 async {
-                    val streamables = if (ext.id == metaExt.id) {
-                        metaTrack.streamables
+                    val streamables = if (remembered?.provider == ext.id) {
+                        // Resolve the exact stored recording. Never silently substitute a fuzzy match.
+                        try {
+                            val exact = if (ext.id == metaExt.id && metaTrack.id == remembered.track) metaTrack
+                            else withTimeout(5_000) {
+                                ext.client<TrackClient>().loadTrack(Track(remembered.track, metaTrack.title), isDownload)
+                            }
+                            if (exact.id != remembered.track) emptyList()
+                            else exact.streamables.map { RememberedSource.tag(it, ext.id, exact.id) }
+                        } catch (cancel: CancellationException) {
+                            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                            emptyList()
+                        } catch (_: Exception) { emptyList() }
+                    } else if (ext.id == metaExt.id) {
+                        metaTrack.streamables.map { RememberedSource.tag(it, ext.id, metaTrack.id) }
                     } else {
                         try {
                             findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
-                        } catch (e: Throwable) {
+                        } catch (cancel: CancellationException) { throw cancel }
+                        catch (e: Throwable) {
                             println("CombineExtension: Extension ${ext.id} failed to find track: ${e.message}")
                             emptyList()
                         }
@@ -268,15 +291,16 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
             }
             val results = deferreds.awaitAll().flatten()
             if (results.isEmpty()) {
-                metaTrack.streamables
+                if (remembered?.provider == metaExt.id) emptyList()
+                else metaTrack.streamables.map { RememberedSource.tag(it, metaExt.id, metaTrack.id) }
             } else {
                 results.sortedWith(compareByDescending<Pair<Streamable, Int>> { it.first.quality }.thenBy { it.second })
                     .map { it.first }
-                    .distinctBy { it.id }
+                    .distinctBy { Triple(it.extras[RememberedSource.PROVIDER], it.extras[RememberedSource.TRACK], it.id) }
             }
         }
 
-        return metaTrack.copy(streamables = allStreamables)
+        return RememberedSource.metadata(metaTrack, track, metaExt.id).copy(streamables = allStreamables)
     }
 
     override suspend fun loadStreamableMedia(streamable: Streamable, isDownload: Boolean): Streamable.Media {
@@ -342,7 +366,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
                 return loaded.copy(streamables = loaded.streamables.map { s ->
                     val existingExtras = s.extras
                     val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
-                    s.copy(extras = updatedExtras)
+                    RememberedSource.tag(s.copy(extras = updatedExtras), streamExt.id, loaded.id)
                 })
             }
         }
