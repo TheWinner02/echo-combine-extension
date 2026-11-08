@@ -29,6 +29,7 @@ import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.providers.MusicExtensionsProvider
 import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingList
+import dev.brahmkshatriya.echo.common.settings.SettingOnClick
 import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
 import kotlinx.coroutines.CancellationException
@@ -53,6 +54,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         const val KEY_METADATA_EXT = "metadata_extension"
         const val KEY_STREAM_EXT = "stream_extension"
         const val KEY_FIRST_AVAILABLE = "first_available"
+        const val KEY_FILTER_HIDDEN = "filter_hidden_tracks"
+        private const val KEY_HIDDEN_ITEMS = "combine_hidden_items"
+        private const val PREFIX_HIDDEN_TITLE = "combine_hidden_title_"
+        private const val PREFIX_HIDDEN_COVER = "combine_hidden_cover_"
     }
 
     private lateinit var settings: Settings
@@ -69,6 +74,56 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     private fun getSettingBoolean(key: String): Boolean? {
         if (!::settings.isInitialized) return null
         return runCatching { settings.getBoolean(key) }.getOrNull()
+    }
+
+    private fun isFilterHiddenEnabled(): Boolean {
+        if (!::settings.isInitialized) return true
+        return runCatching { settings.getBoolean(KEY_FILTER_HIDDEN) }.getOrNull() ?: true
+    }
+
+    private fun getHiddenItems(): Set<String> {
+        if (!::settings.isInitialized) return emptySet()
+        return runCatching { settings.getStringSet(KEY_HIDDEN_ITEMS) }.getOrNull() ?: emptySet()
+    }
+
+    private fun setHiddenItem(itemId: String, shouldHide: Boolean, title: String? = null, coverUrl: String? = null) {
+        if (!::settings.isInitialized) return
+        val current = getHiddenItems().toMutableSet()
+        val titleKey = "$PREFIX_HIDDEN_TITLE$itemId"
+        val coverKey = "$PREFIX_HIDDEN_COVER$itemId"
+        if (shouldHide) {
+            current.add(itemId)
+            if (!title.isNullOrBlank()) {
+                runCatching { settings.putString(titleKey, title) }
+            }
+            if (!coverUrl.isNullOrBlank()) {
+                runCatching { settings.putString(coverKey, coverUrl) }
+            }
+        } else {
+            current.remove(itemId)
+            runCatching { settings.putString(titleKey, null) }
+            runCatching { settings.putString(coverKey, null) }
+        }
+        runCatching { settings.putStringSet(KEY_HIDDEN_ITEMS, current) }
+    }
+
+    private fun clearAllHiddenItems() {
+        if (!::settings.isInitialized) return
+        val current = getHiddenItems()
+        for (id in current) {
+            runCatching { settings.putString("$PREFIX_HIDDEN_TITLE$id", null) }
+            runCatching { settings.putString("$PREFIX_HIDDEN_COVER$id", null) }
+        }
+        runCatching { settings.putStringSet(KEY_HIDDEN_ITEMS, emptySet()) }
+    }
+
+    private fun getHiddenItemsWithTitles(): List<Pair<String, String>> {
+        val items = getHiddenItems()
+        if (items.isEmpty()) return emptyList()
+        return items.map { id ->
+            val title = runCatching { settings.getString("$PREFIX_HIDDEN_TITLE$id") }.getOrNull()
+            id to (title ?: id)
+        }.sortedBy { it.second.lowercase() }
     }
 
     override suspend fun getSettingItems(): List<Setting> {
@@ -125,6 +180,24 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
                 break
             }
         }
+
+        settingsList.add(
+            SettingSwitch(
+                "Filter Hidden Tracks",
+                KEY_FILTER_HIDDEN,
+                "Automatically exclude hidden tracks from playlists, albums and radios",
+                true
+            )
+        )
+
+        val hiddenCount = getHiddenItems().size
+        settingsList.add(
+            SettingOnClick(
+                "Gestisci brani nascosti",
+                "manage_hidden_tracks",
+                if (hiddenCount == 0) "Nessun brano nascosto" else "$hiddenCount brani nascosti • Tocca per gestire"
+            ) {}
+        )
 
         return settingsList
     }
@@ -472,18 +545,54 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (_: Throwable) { emptyList() }
 
+    private fun Feed<Track>.filterHidden(): Feed<Track> {
+        return Feed(tabs) { tab ->
+            val originalData = getPagedData(tab)
+            if (!isFilterHiddenEnabled()) return@Feed originalData
+
+            val hidden = getHiddenItems()
+            val meta = runCatching { getMetadataExtension() }.getOrNull()
+            val hideClient = meta?.clientOrNull<HideClient>()
+
+            val isHiddenTrack: suspend (Track) -> Boolean = { track ->
+                if (hideClient != null) {
+                    runCatching { hideClient.isItemHidden(track) }.getOrDefault(false)
+                } else {
+                    track.id in hidden
+                }
+            }
+
+            val filteredPaged = originalData.pagedData.map { result ->
+                val list = result.getOrDefault(emptyList())
+                list.filter { track -> !isHiddenTrack(track) }
+            }
+
+            val origButtons = originalData.buttons
+            val filteredCustom = origButtons?.customTrackList?.filter { track ->
+                !isHiddenTrack(track)
+            }
+            val buttons = if (origButtons != null && origButtons.customTrackList != null) {
+                origButtons.copy(customTrackList = filteredCustom)
+            } else {
+                origButtons
+            }
+
+            Feed.Data(filteredPaged, buttons, originalData.background)
+        }
+    }
+
     override suspend fun loadAlbum(album: Album): Album = getMetadataExtension().client<AlbumClient>().loadAlbum(album)
-    override suspend fun loadTracks(album: Album): Feed<Track>? = getMetadataExtension().clientOrNull<AlbumClient>()?.loadTracks(album)
+    override suspend fun loadTracks(album: Album): Feed<Track>? = getMetadataExtension().clientOrNull<AlbumClient>()?.loadTracks(album)?.filterHidden()
     override suspend fun loadFeed(album: Album): Feed<Shelf>? = getMetadataExtension().clientOrNull<AlbumClient>()?.loadFeed(album)
     override suspend fun loadArtist(artist: Artist): Artist = getMetadataExtension().client<ArtistClient>().loadArtist(artist)
     override suspend fun loadFeed(artist: Artist): Feed<Shelf> = getMetadataExtension().client<ArtistClient>().loadFeed(artist)
     override suspend fun loadPlaylist(playlist: Playlist): Playlist = getMetadataExtension().client<PlaylistClient>().loadPlaylist(playlist)
-    override suspend fun loadTracks(playlist: Playlist): Feed<Track> = getMetadataExtension().client<PlaylistClient>().loadTracks(playlist)
+    override suspend fun loadTracks(playlist: Playlist): Feed<Track> = getMetadataExtension().client<PlaylistClient>().loadTracks(playlist).filterHidden()
     override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = getMetadataExtension().clientOrNull<PlaylistClient>()?.loadFeed(playlist)
     override suspend fun listEditablePlaylists(track: Track?): List<Pair<Playlist, Boolean>> = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.listEditablePlaylists(track) ?: emptyList()
     override suspend fun createPlaylist(title: String, description: String?): Playlist = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.createPlaylist(title, description) ?: throw Exception("Not supported")
-    override suspend fun addTracksToPlaylist(playlist: Playlist, tracks: List<Track>, position: Int, previousTracks: List<Track>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.addTracksToPlaylist(playlist, tracks, position, previousTracks) ?: throw Exception("Not supported")
-    override suspend fun removeTracksFromPlaylist(playlist: Playlist, tracks: List<Track>, index: List<Int>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.removeTracksFromPlaylist(playlist, tracks, index) ?: throw Exception("Not supported")
+    override suspend fun addTracksToPlaylist(playlist: Playlist, tracks: List<Track>, index: Int, new: List<Track>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.addTracksToPlaylist(playlist, tracks, index, new) ?: throw Exception("Not supported")
+    override suspend fun removeTracksFromPlaylist(playlist: Playlist, tracks: List<Track>, indexes: List<Int>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.removeTracksFromPlaylist(playlist, tracks, indexes) ?: throw Exception("Not supported")
     override suspend fun moveTrackInPlaylist(playlist: Playlist, tracks: List<Track>, fromIndex: Int, toIndex: Int) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.moveTrackInPlaylist(playlist, tracks, fromIndex, toIndex) ?: throw Exception("Not supported")
     override suspend fun editPlaylistMetadata(playlist: Playlist, title: String, description: String?) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.editPlaylistMetadata(playlist, title, description) ?: throw Exception("Not supported")
     override suspend fun deletePlaylist(playlist: Playlist) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.deletePlaylist(playlist) ?: throw Exception("Not supported")
@@ -495,9 +604,36 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     override suspend fun isFollowing(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<FollowClient>()?.isFollowing(item) ?: false
     override suspend fun followItem(item: EchoMediaItem, shouldFollow: Boolean) = getMetadataExtension().clientOrNull<FollowClient>()?.followItem(item, shouldFollow) ?: throw Exception("Not supported")
     override suspend fun getFollowersCount(item: EchoMediaItem): Long? = getMetadataExtension().clientOrNull<FollowClient>()?.getFollowersCount(item)
-    override suspend fun isItemHidden(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<HideClient>()?.isItemHidden(item) ?: false
-    override suspend fun hideItem(item: EchoMediaItem, shouldHide: Boolean) = getMetadataExtension().clientOrNull<HideClient>()?.hideItem(item, shouldHide) ?: throw Exception("Not supported")
+    override suspend fun isItemHidden(item: EchoMediaItem): Boolean {
+        val meta = runCatching { getMetadataExtension() }.getOrNull()
+        val hideClient = meta?.clientOrNull<HideClient>()
+        if (hideClient != null) {
+            return runCatching { hideClient.isItemHidden(item) }.getOrDefault(false)
+        }
+        return item.id in getHiddenItems()
+    }
+
+    override suspend fun hideItem(item: EchoMediaItem, shouldHide: Boolean) {
+        val meta = runCatching { getMetadataExtension() }.getOrNull()
+        val hideClient = meta?.clientOrNull<HideClient>()
+        if (hideClient != null) {
+            hideClient.hideItem(item, shouldHide)
+        } else {
+            val title = if (item is Track && item.artists.isNotEmpty()) {
+                "${item.title} - ${item.artists.joinToString { it.name }}"
+            } else {
+                item.title
+            }
+            val coverUrl = when (val c = (item as? Track)?.cover ?: (item as? Track)?.album?.cover ?: item.cover) {
+                is dev.brahmkshatriya.echo.common.models.ImageHolder.NetworkRequestImageHolder -> c.request.url
+                is dev.brahmkshatriya.echo.common.models.ImageHolder.ResourceUriImageHolder -> c.uri
+                else -> null
+            }
+            setHiddenItem(item.id, shouldHide, title, coverUrl)
+        }
+    }
+
     override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.radio(item, context) ?: throw Exception("Not supported")
     override suspend fun loadRadio(radio: Radio): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.loadRadio(radio) ?: throw Exception("Not supported")
-    override suspend fun loadTracks(radio: Radio): Feed<Track> = getMetadataExtension().clientOrNull<RadioClient>()?.loadTracks(radio) ?: throw Exception("Not supported")
+    override suspend fun loadTracks(radio: Radio): Feed<Track> = (getMetadataExtension().clientOrNull<RadioClient>()?.loadTracks(radio) ?: throw Exception("Not supported")).filterHidden()
 }

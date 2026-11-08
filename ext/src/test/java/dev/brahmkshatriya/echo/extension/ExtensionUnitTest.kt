@@ -4,6 +4,7 @@ import dev.brahmkshatriya.echo.common.MusicExtension
 import dev.brahmkshatriya.echo.common.clients.AlbumClient
 import dev.brahmkshatriya.echo.common.clients.ArtistClient
 import dev.brahmkshatriya.echo.common.clients.ExtensionClient
+import dev.brahmkshatriya.echo.common.clients.HideClient
 import dev.brahmkshatriya.echo.common.clients.HomeFeedClient
 import dev.brahmkshatriya.echo.common.clients.RadioClient
 import dev.brahmkshatriya.echo.common.clients.SearchFeedClient
@@ -26,6 +27,7 @@ import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.providers.MusicExtensionsProvider
 import dev.brahmkshatriya.echo.common.settings.Setting
+import dev.brahmkshatriya.echo.common.settings.SettingOnClick
 import dev.brahmkshatriya.echo.common.settings.Settings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.DelicateCoroutinesApi
@@ -37,6 +39,7 @@ import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -231,6 +234,52 @@ class ExtensionUnitTest {
         assertNotNull(loadedAlbum)
         val tracks = extension.loadTracks(loadedAlbum)?.loadAll()
         assertTrue(!tracks.isNullOrEmpty())
+    }
+
+    @Test
+    fun testHideItemFallback() = testIn("Testing Hide Item Fallback") {
+        if (extension !is HideClient) error("HideClient is not implemented")
+        val track = searchTrack()
+        assertFalse(extension.isItemHidden(track))
+        extension.hideItem(track, true)
+        assertTrue(extension.isItemHidden(track))
+        extension.hideItem(track, false)
+        assertFalse(extension.isItemHidden(track))
+    }
+
+    @Test
+    fun testFilterHiddenTracks() = testIn("Testing Filter Hidden Tracks") {
+        if (extension !is HideClient || extension !is RadioClient) error("Clients not implemented")
+        val track = searchTrack()
+        val radio = extension.radio(track, null)
+        val initialTracks = extension.loadTracks(radio).loadAll()
+        assertTrue(initialTracks.any { it.id == track.id })
+
+        extension.hideItem(track, true)
+        val filteredTracks = extension.loadTracks(radio).loadAll()
+        assertFalse(filteredTracks.any { it.id == track.id })
+
+        extension.hideItem(track, false)
+        val restoredTracks = extension.loadTracks(radio).loadAll()
+        assertTrue(restoredTracks.any { it.id == track.id })
+    }
+
+    @Test
+    fun testHiddenSettingsAndIndividualUnhide() = testIn("Testing Hidden Settings and Individual Unhide") {
+        if (extension !is HideClient) error("HideClient not implemented")
+        val track = searchTrack()
+        val settingsBefore = extension.getSettingItems()
+        val manageBefore = settingsBefore.filterIsInstance<SettingOnClick>().find { it.key == "manage_hidden_tracks" }
+        assertNotNull(manageBefore)
+        assertEquals("Nessun brano nascosto", manageBefore!!.summary)
+
+        extension.hideItem(track, true)
+        assertTrue(extension.isItemHidden(track))
+
+        val settingsAfter = extension.getSettingItems()
+        val manageAfter = settingsAfter.filterIsInstance<SettingOnClick>().find { it.key == "manage_hidden_tracks" }
+        assertNotNull(manageAfter)
+        assertTrue(manageAfter!!.summary?.contains("1") == true)
     }
 
     private fun testIn(title: String, block: suspend CoroutineScope.() -> Unit) = runBlocking {
