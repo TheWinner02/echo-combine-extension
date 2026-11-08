@@ -193,9 +193,9 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val hiddenCount = getHiddenItems().size
         settingsList.add(
             SettingOnClick(
-                "Gestisci brani nascosti",
+                "Manage hidden tracks",
                 "manage_hidden_tracks",
-                if (hiddenCount == 0) "Nessun brano nascosto" else "$hiddenCount brani nascosti • Tocca per gestire"
+                if (hiddenCount == 0) "No hidden tracks • Tap to manage" else "$hiddenCount hidden tracks • Tap to manage"
             ) {}
         )
 
