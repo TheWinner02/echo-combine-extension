@@ -26,6 +26,7 @@ import dev.brahmkshatriya.echo.common.models.Radio
 import dev.brahmkshatriya.echo.common.models.Shelf
 import dev.brahmkshatriya.echo.common.models.Streamable
 import dev.brahmkshatriya.echo.common.models.Track
+import dev.brahmkshatriya.echo.common.providers.GlobalSettingsProvider
 import dev.brahmkshatriya.echo.common.providers.MusicExtensionsProvider
 import dev.brahmkshatriya.echo.common.settings.Setting
 import dev.brahmkshatriya.echo.common.settings.SettingList
@@ -43,7 +44,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
 
-class CombineExtension : ExtensionClient, MusicExtensionsProvider,
+class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSettingsProvider,
     HomeFeedClient, SearchFeedClient, TrackClient,
     AlbumClient, ArtistClient, PlaylistClient, PlaylistEditClient,
     SaveClient, LikeClient, ShareClient, FollowClient, HideClient, RadioClient,
@@ -59,6 +60,11 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         private const val PREFIX_HIDDEN_TITLE = "combine_hidden_title_"
         private const val PREFIX_HIDDEN_COVER = "combine_hidden_cover_"
     }
+
+    private var globalSettings: Settings? = null
+    private val text = ExtensionStrings { globalSettings }
+
+    override fun setGlobalSettings(globalSettings: Settings) { this.globalSettings = globalSettings }
 
     private lateinit var settings: Settings
 
@@ -132,27 +138,27 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val extNames = extensions.map { it.name }
 
         val altIds = listOf("none") + extIds
-        val altNames = listOf("None") + extNames
+        val altNames = listOf(text.get("shared.none", "None")) + extNames
 
         val settingsList = mutableListOf<Setting>(
             SettingList(
-                "Metadata Extension",
+                text.get("combine.metadata_title", "Metadata extension"),
                 KEY_METADATA_EXT,
-                "Extension to use for metadata (search, feed, album info, etc.)",
+                text.get("combine.metadata_summary", "Extension used for search, feeds and album information."),
                 extNames,
                 extIds,
                 0
             ),
             SettingSwitch(
-                "First Available Mode",
+                text.get("combine.first_title", "First available source"),
                 KEY_FIRST_AVAILABLE,
-                "Return only streams from the highest priority extension that finds the track",
+                text.get("combine.first_summary", "Use only the highest-priority extension that finds the track."),
                 false
             ),
             SettingList(
-                "Preferred Stream Extension",
+                text.get("combine.stream_title", "Preferred audio source"),
                 KEY_STREAM_EXT,
-                "The primary extension to use for audio streaming",
+                text.get("combine.stream_summary", "Primary extension used for audio playback."),
                 extNames,
                 extIds,
                 0
@@ -160,16 +166,15 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         )
 
         var lastKey = KEY_STREAM_EXT
-        val suffixes = listOf("2nd", "3rd", "4th", "5th")
-        for (i in suffixes.indices) {
+        for (i in 0 until 4) {
             val value = getSettingString(lastKey)
             if (value != null && value != "none") {
                 val currentKey = "${KEY_STREAM_EXT}_${i + 1}"
                 settingsList.add(
                     SettingList(
-                        "${suffixes[i]} Alternative Stream Extension",
+                        text.get("combine.alternative_title", "Alternative audio source %1\$d", i + 2),
                         currentKey,
-                        "Backup extension if the previous ones fail to find the track",
+                        text.get("combine.alternative_summary", "Used when the preceding sources cannot find the track."),
                         altNames,
                         altIds,
                         0
@@ -183,9 +188,9 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
         settingsList.add(
             SettingSwitch(
-                "Filter Hidden Tracks",
+                text.get("combine.filter_title", "Filter hidden tracks"),
                 KEY_FILTER_HIDDEN,
-                "Automatically exclude hidden tracks from playlists, albums and radios",
+                text.get("combine.filter_summary", "Exclude hidden tracks from playlists, albums and radios."),
                 true
             )
         )
@@ -193,9 +198,9 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val hiddenCount = getHiddenItems().size
         settingsList.add(
             SettingOnClick(
-                "Manage hidden tracks",
+                text.get("combine.manage_hidden_title", "Manage hidden tracks"),
                 "manage_hidden_tracks",
-                if (hiddenCount == 0) "No hidden tracks • Tap to manage" else "$hiddenCount hidden tracks • Tap to manage"
+                if (hiddenCount == 0) text.get("combine.hidden_none", "No hidden tracks • Tap to manage") else text.get("combine.hidden_count", "%1\$d hidden tracks • Tap to manage", hiddenCount)
             ) {}
         )
 
@@ -260,7 +265,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     private suspend fun getSelectedExtension(key: String): MusicExtension {
         val exts = awaitExtensions()
-        if (exts.isEmpty()) throw Exception("No music extensions installed")
+        if (exts.isEmpty()) throw Exception(text.get("combine.no_extensions", "No music extensions installed."))
         val selectedValue = getSettingString(key)
 
         if (selectedValue == null) {
@@ -285,8 +290,8 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     @Suppress("UNCHECKED_CAST")
     private suspend inline fun <reified T> MusicExtension.client(): T {
-        val inst = instance.value().getOrNull() ?: throw Exception("Extension '${name}' failed to initialize")
-        return inst as? T ?: throw Exception("Extension '${name}' does not support ${T::class.simpleName}")
+        val inst = instance.value().getOrNull() ?: throw Exception(text.get("combine.init_failed", "Extension %1\$s could not be initialized.", name))
+        return inst as? T ?: throw Exception(text.get("combine.unsupported", "Extension %1\$s does not support %2\$s.", name, T::class.simpleName.orEmpty()))
     }
 
     private suspend inline fun <reified T> MusicExtension.clientOrNull(): T? {
@@ -297,7 +302,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
 
     override suspend fun loadLibraryFeed(): Feed<Shelf> {
         val client = getMetadataExtension().clientOrNull<LibraryFeedClient>()
-            ?: throw Exception("The selected metadata extension does not support the Library feed.")
+            ?: throw Exception(text.get("combine.library_unsupported", "The selected metadata extension does not support the library."))
         return client.loadLibraryFeed()
     }
 
@@ -307,7 +312,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val metaExt = getMetadataExtension()
         val originalCatalog = track.extras[RememberedSource.CATALOG]
         check(originalCatalog == null || originalCatalog == metaExt.id) {
-            "Metadata source changed. Reopen this song from the current catalogue."
+            text.get("combine.metadata_changed", "Metadata source changed. Reopen this song from the current catalogue.")
         }
         val metaClient = metaExt.client<TrackClient>()
         val metaTrack = try {
@@ -381,7 +386,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         val exts = awaitExtensions()
         val ext = if (streamExtId != null) exts.find { it.id == streamExtId } else getMetadataExtension()
         return ext?.client<TrackClient>()?.loadStreamableMedia(streamable, isDownload)
-            ?: throw Exception("Extension '${streamExtId ?: "metadata"}' not found or not supporting playback")
+            ?: throw Exception(text.get("combine.playback_unavailable", "Extension %1\$s is unavailable or does not support playback.", streamExtId ?: text.get("combine.metadata_title", "Metadata extension")))
     }
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = getMetadataExtension().clientOrNull<TrackClient>()?.loadFeed(track)
@@ -590,19 +595,19 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
     override suspend fun loadTracks(playlist: Playlist): Feed<Track> = getMetadataExtension().client<PlaylistClient>().loadTracks(playlist).filterHidden()
     override suspend fun loadFeed(playlist: Playlist): Feed<Shelf>? = getMetadataExtension().clientOrNull<PlaylistClient>()?.loadFeed(playlist)
     override suspend fun listEditablePlaylists(track: Track?): List<Pair<Playlist, Boolean>> = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.listEditablePlaylists(track) ?: emptyList()
-    override suspend fun createPlaylist(title: String, description: String?): Playlist = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.createPlaylist(title, description) ?: throw Exception("Not supported")
-    override suspend fun addTracksToPlaylist(playlist: Playlist, tracks: List<Track>, index: Int, new: List<Track>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.addTracksToPlaylist(playlist, tracks, index, new) ?: throw Exception("Not supported")
-    override suspend fun removeTracksFromPlaylist(playlist: Playlist, tracks: List<Track>, indexes: List<Int>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.removeTracksFromPlaylist(playlist, tracks, indexes) ?: throw Exception("Not supported")
-    override suspend fun moveTrackInPlaylist(playlist: Playlist, tracks: List<Track>, fromIndex: Int, toIndex: Int) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.moveTrackInPlaylist(playlist, tracks, fromIndex, toIndex) ?: throw Exception("Not supported")
-    override suspend fun editPlaylistMetadata(playlist: Playlist, title: String, description: String?) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.editPlaylistMetadata(playlist, title, description) ?: throw Exception("Not supported")
-    override suspend fun deletePlaylist(playlist: Playlist) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.deletePlaylist(playlist) ?: throw Exception("Not supported")
+    override suspend fun createPlaylist(title: String, description: String?): Playlist = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.createPlaylist(title, description) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun addTracksToPlaylist(playlist: Playlist, tracks: List<Track>, index: Int, new: List<Track>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.addTracksToPlaylist(playlist, tracks, index, new) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun removeTracksFromPlaylist(playlist: Playlist, tracks: List<Track>, indexes: List<Int>) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.removeTracksFromPlaylist(playlist, tracks, indexes) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun moveTrackInPlaylist(playlist: Playlist, tracks: List<Track>, fromIndex: Int, toIndex: Int) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.moveTrackInPlaylist(playlist, tracks, fromIndex, toIndex) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun editPlaylistMetadata(playlist: Playlist, title: String, description: String?) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.editPlaylistMetadata(playlist, title, description) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun deletePlaylist(playlist: Playlist) = getMetadataExtension().clientOrNull<PlaylistEditClient>()?.deletePlaylist(playlist) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
     override suspend fun isItemSaved(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<SaveClient>()?.isItemSaved(item) ?: false
-    override suspend fun saveToLibrary(item: EchoMediaItem, shouldSave: Boolean) = getMetadataExtension().clientOrNull<SaveClient>()?.saveToLibrary(item, shouldSave) ?: throw Exception("Not supported")
+    override suspend fun saveToLibrary(item: EchoMediaItem, shouldSave: Boolean) = getMetadataExtension().clientOrNull<SaveClient>()?.saveToLibrary(item, shouldSave) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
     override suspend fun isItemLiked(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<LikeClient>()?.isItemLiked(item) ?: false
-    override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) = getMetadataExtension().clientOrNull<LikeClient>()?.likeItem(item, shouldLike) ?: throw Exception("Not supported")
-    override suspend fun onShare(item: EchoMediaItem): String = getMetadataExtension().clientOrNull<ShareClient>()?.onShare(item) ?: throw Exception("Not supported")
+    override suspend fun likeItem(item: EchoMediaItem, shouldLike: Boolean) = getMetadataExtension().clientOrNull<LikeClient>()?.likeItem(item, shouldLike) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun onShare(item: EchoMediaItem): String = getMetadataExtension().clientOrNull<ShareClient>()?.onShare(item) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
     override suspend fun isFollowing(item: EchoMediaItem): Boolean = getMetadataExtension().clientOrNull<FollowClient>()?.isFollowing(item) ?: false
-    override suspend fun followItem(item: EchoMediaItem, shouldFollow: Boolean) = getMetadataExtension().clientOrNull<FollowClient>()?.followItem(item, shouldFollow) ?: throw Exception("Not supported")
+    override suspend fun followItem(item: EchoMediaItem, shouldFollow: Boolean) = getMetadataExtension().clientOrNull<FollowClient>()?.followItem(item, shouldFollow) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
     override suspend fun getFollowersCount(item: EchoMediaItem): Long? = getMetadataExtension().clientOrNull<FollowClient>()?.getFollowersCount(item)
     override suspend fun isItemHidden(item: EchoMediaItem): Boolean {
         val meta = runCatching { getMetadataExtension() }.getOrNull()
@@ -633,7 +638,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider,
         }
     }
 
-    override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.radio(item, context) ?: throw Exception("Not supported")
-    override suspend fun loadRadio(radio: Radio): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.loadRadio(radio) ?: throw Exception("Not supported")
-    override suspend fun loadTracks(radio: Radio): Feed<Track> = (getMetadataExtension().clientOrNull<RadioClient>()?.loadTracks(radio) ?: throw Exception("Not supported")).filterHidden()
+    override suspend fun radio(item: EchoMediaItem, context: EchoMediaItem?): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.radio(item, context) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun loadRadio(radio: Radio): Radio = getMetadataExtension().clientOrNull<RadioClient>()?.loadRadio(radio) ?: throw Exception(text.get("combine.not_supported", "Not supported."))
+    override suspend fun loadTracks(radio: Radio): Feed<Track> = (getMetadataExtension().clientOrNull<RadioClient>()?.loadTracks(radio) ?: throw Exception(text.get("combine.not_supported", "Not supported."))).filterHidden()
 }
