@@ -253,7 +253,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
 
         for (i in 1..5) {
             val id = getSettingString("${KEY_STREAM_EXT}_$i")
-            findExt(id)?.let { result.add(it) } ?: break
+            findExt(id)?.let { result.add(it) }
         }
 
         if (metaExt != null && result.none { it.id == metaExt.id }) {
@@ -405,10 +405,12 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             } ?: return null
         } catch (_: Throwable) { return null }
 
-        val targetTab = feed.tabs.find { tab ->
-            val tabTitle = tab.title.lowercase()
-            tabTitle.contains("song") || tabTitle.contains("track") || tabTitle.contains("single")
-        } ?: feed.tabs.firstOrNull()
+        val trackTabs = setOf("song", "songs", "track", "tracks", "single", "singles")
+        val targetTab = feed.tabs.find { it.id.lowercase(java.util.Locale.ROOT) in trackTabs }
+            ?: feed.tabs.find { tab ->
+                val tabTitle = tab.title.lowercase(java.util.Locale.ROOT)
+                tabTitle.contains("song") || tabTitle.contains("track") || tabTitle.contains("single")
+            } ?: feed.tabs.firstOrNull()
 
         val shelves = try {
             loadFirstPage(feed.getPagedData(targetTab).pagedData)
