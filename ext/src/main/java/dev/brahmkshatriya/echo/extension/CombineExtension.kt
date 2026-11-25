@@ -43,6 +43,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.time.Duration.Companion.milliseconds
 
 class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSettingsProvider,
     HomeFeedClient, SearchFeedClient, TrackClient,
@@ -233,11 +234,13 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
         val exts = awaitExtensions()
         if (exts.isEmpty()) return emptyList()
         val result = mutableListOf<MusicExtension>()
-        val metaExt = runCatching { getMetadataExtension() }.getOrNull()
 
         fun findExt(id: String?): MusicExtension? {
             if (id.isNullOrEmpty() || id == "none") return null
-            return exts.find { it.id == id || it.name == id }
+            return exts.find {
+                it.id == id ||
+                it.name.equals(id, ignoreCase = true)
+            }
         }
 
         // Legacy Migration
@@ -256,6 +259,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             findExt(id)?.let { result.add(it) }
         }
 
+        val metaExt = runCatching { getMetadataExtension() }.getOrNull()
         if (metaExt != null && result.none { it.id == metaExt.id }) {
             result.add(metaExt)
         }
@@ -283,7 +287,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             return exts.first()
         }
 
-        val match = exts.find { it.id == selectedValue || it.name == selectedValue }
+        val match = exts.find {
+            it.id == selectedValue ||
+            it.name.equals(selectedValue, ignoreCase = true)
+        }
         if (match != null) return match
 
         val index = selectedValue.toIntOrNull()
@@ -325,7 +332,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             metaClient.loadTrack(track, isDownload)
         } catch (cancel: CancellationException) { throw cancel }
         catch (e: Throwable) {
-            println("CombineExtension: Metadata extension failed to load track: ${e.message}")
+            // A metadata error must not print credentials or full provider responses.
             track
         }
 
@@ -334,12 +341,12 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
 
         val allStreamables = coroutineScope {
             val deferreds = streamExts.mapIndexed { index, ext ->
-                async {
+                async { withTimeoutOrNull(12_000.milliseconds) {
                     val streamables = if (remembered?.provider == ext.id) {
                         // Resolve the exact stored recording. Never silently substitute a fuzzy match.
                         try {
                             val exact = if (ext.id == metaExt.id && metaTrack.id == remembered.track) metaTrack
-                            else withTimeout(5_000) {
+                            else withTimeout(5_000.milliseconds) {
                                 ext.client<TrackClient>().loadTrack(Track(remembered.track, metaTrack.title), isDownload)
                             }
                             if (exact.id != remembered.track) emptyList()
@@ -352,10 +359,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
                         metaTrack.streamables.map { RememberedSource.tag(it, ext.id, metaTrack.id) }
                     } else {
                         try {
-                            findTrackInStreamExtension(metaTrack, ext)?.streamables ?: emptyList()
+                            findTrackInStreamExtension(metaTrack, ext, isDownload)?.streamables ?: emptyList()
                         } catch (cancel: CancellationException) { throw cancel }
                         catch (e: Throwable) {
-                            println("CombineExtension: Extension ${ext.id} failed to find track: ${e.message}")
+                            // Continue with the other providers without logging sensitive provider responses.
                             emptyList()
                         }
                     }
@@ -371,7 +378,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
                         }
                         s.copy(title = titleWithExt, extras = updatedExtras) to index
                     }
-                }
+                } ?: emptyList() }
             }
             val results = deferreds.awaitAll().flatten()
             if (results.isEmpty()) {
@@ -397,7 +404,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
 
     override suspend fun loadFeed(track: Track): Feed<Shelf>? = getMetadataExtension().clientOrNull<TrackClient>()?.loadFeed(track)
 
-    private suspend fun findTrackInStreamExtension(metaTrack: Track, streamExt: MusicExtension): Track? = try {
+    private suspend fun findTrackInStreamExtension(metaTrack: Track, streamExt: MusicExtension, isDownload: Boolean): Track? { return try {
         val searchClient = streamExt.clientOrNull<SearchFeedClient>() ?: return null
         val trackClient = streamExt.clientOrNull<TrackClient>() ?: return null
 
@@ -411,10 +418,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
         // 1. Direct ISRC lookup via TrackClient if supported (not for YouTube Music)
         if (isrc.isNotEmpty() && !isYouTube) {
             val direct = try {
-                withTimeoutOrNull(4000) {
-                    trackClient.loadTrack(Track(id = "", title = metaTrack.title, isrc = isrc), false)
+                withTimeoutOrNull(5000) {
+                    trackClient.loadTrack(Track(id = "", title = metaTrack.title, isrc = isrc), isDownload)
                 }
-            } catch (_: Throwable) { null }
+            } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { null }
 
             if (direct != null && direct.id.isNotBlank() && direct.streamables.isNotEmpty()) {
                 val cleanId = direct.id
@@ -428,10 +435,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
 
         suspend fun searchCandidates(searchQuery: String): List<Track> {
             val feed = try {
-                withTimeoutOrNull(5000) {
+                withTimeoutOrNull(8000) {
                     searchClient.loadSearchFeed(searchQuery)
                 } ?: return emptyList()
-            } catch (_: Throwable) { return emptyList() }
+            } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { return emptyList() }
 
             val trackTabs = setOf("song", "songs", "track", "tracks", "single", "singles")
             val targetTab = feed.tabs.find { it.id.lowercase(java.util.Locale.ROOT) in trackTabs }
@@ -442,7 +449,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
 
             val shelves = try {
                 loadFirstPage(feed.getPagedData(targetTab).pagedData)
-            } catch (_: Throwable) {
+            } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) {
                 emptyList()
             }
 
@@ -480,10 +487,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
         for ((candidate, _) in scoredCandidates) {
             if (candidate.id.isBlank()) continue
             val loaded = try {
-                withTimeoutOrNull(5000) {
-                    trackClient.loadTrack(candidate, false)
+                withTimeoutOrNull(6000) {
+                    trackClient.loadTrack(candidate, isDownload)
                 }
-            } catch (_: Throwable) { null }
+            } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { null }
 
             if (loaded != null && loaded.id.isNotBlank() && loaded.streamables.isNotEmpty()) {
                 return loaded.copy(streamables = loaded.streamables.map { s ->
@@ -494,8 +501,10 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             }
         }
         null
-    } catch (_: Throwable) {
+    } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) {
         null
+    }
+
     }
 
     private fun scoreMatch(target: Track, candidate: Track): Double {
@@ -593,7 +602,7 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             .trim()
     }
 
-    private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (_: Throwable) { emptyList() }
+    private suspend fun <T : Any> loadFirstPage(pagedData: PagedData<T>): List<T> = try { pagedData.loadPage(null).data } catch (cancel: CancellationException) { throw cancel } catch (_: Exception) { emptyList() }
 
     private fun Feed<Track>.filterHidden(): Feed<Track> {
         return Feed(tabs) { tab ->
