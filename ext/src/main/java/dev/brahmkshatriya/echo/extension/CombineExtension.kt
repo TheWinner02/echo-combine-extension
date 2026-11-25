@@ -395,39 +395,72 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
         val searchClient = streamExt.clientOrNull<SearchFeedClient>() ?: return null
         val trackClient = streamExt.clientOrNull<TrackClient>() ?: return null
 
+        val isrc = metaTrack.isrc?.trim().orEmpty()
         val artistName = metaTrack.artists.firstOrNull()?.name ?: ""
         val query = "${metaTrack.title} $artistName".trim()
-        if (query.isEmpty()) return null
+        if (query.isEmpty() && isrc.isEmpty()) return null
 
-        val feed = try {
-            withTimeoutOrNull(5000) {
-                searchClient.loadSearchFeed(query)
-            } ?: return null
-        } catch (_: Throwable) { return null }
+        // 1. Direct ISRC lookup via TrackClient if supported
+        if (isrc.isNotEmpty()) {
+            val direct = try {
+                withTimeoutOrNull(4000) {
+                    trackClient.loadTrack(Track(id = "", title = metaTrack.title, isrc = isrc), false)
+                }
+            } catch (_: Throwable) { null }
 
-        val trackTabs = setOf("song", "songs", "track", "tracks", "single", "singles")
-        val targetTab = feed.tabs.find { it.id.lowercase(java.util.Locale.ROOT) in trackTabs }
-            ?: feed.tabs.find { tab ->
-                val tabTitle = tab.title.lowercase(java.util.Locale.ROOT)
-                tabTitle.contains("song") || tabTitle.contains("track") || tabTitle.contains("single")
-            } ?: feed.tabs.firstOrNull()
+            if (direct != null && direct.streamables.isNotEmpty()) {
+                val cleanId = direct.id.ifEmpty { isrc }
+                return direct.copy(streamables = direct.streamables.map { s ->
+                    val existingExtras = s.extras
+                    val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
+                    RememberedSource.tag(s.copy(extras = updatedExtras), streamExt.id, cleanId)
+                })
+            }
+        }
 
-        val shelves = try {
-            loadFirstPage(feed.getPagedData(targetTab).pagedData)
-        } catch (_: Throwable) {
-            emptyList()
+        suspend fun searchCandidates(searchQuery: String): List<Track> {
+            val feed = try {
+                withTimeoutOrNull(5000) {
+                    searchClient.loadSearchFeed(searchQuery)
+                } ?: return emptyList()
+            } catch (_: Throwable) { return emptyList() }
+
+            val trackTabs = setOf("song", "songs", "track", "tracks", "single", "singles")
+            val targetTab = feed.tabs.find { it.id.lowercase(java.util.Locale.ROOT) in trackTabs }
+                ?: feed.tabs.find { tab ->
+                    val tabTitle = tab.title.lowercase(java.util.Locale.ROOT)
+                    tabTitle.contains("song") || tabTitle.contains("track") || tabTitle.contains("single")
+                } ?: feed.tabs.firstOrNull()
+
+            val shelves = try {
+                loadFirstPage(feed.getPagedData(targetTab).pagedData)
+            } catch (_: Throwable) {
+                emptyList()
+            }
+
+            val candidates = mutableListOf<Track>()
+            for (shelf in shelves) {
+                when (shelf) {
+                    is Shelf.Item -> {
+                        (shelf.media as? Track)?.let { candidates.add(it) }
+                    }
+                    is Shelf.Lists.Tracks -> candidates.addAll(shelf.list)
+                    is Shelf.Lists.Items -> candidates.addAll(shelf.list.mapNotNull { it as? Track })
+                    else -> {}
+                }
+            }
+            return candidates
         }
 
         val allCandidates = mutableListOf<Track>()
-        for (shelf in shelves) {
-            when (shelf) {
-                is Shelf.Item -> {
-                    (shelf.media as? Track)?.let { allCandidates.add(it) }
-                }
-                is Shelf.Lists.Tracks -> allCandidates.addAll(shelf.list)
-                is Shelf.Lists.Items -> allCandidates.addAll(shelf.list.mapNotNull { it as? Track })
-                else -> {}
+        if (isrc.isNotEmpty()) {
+            allCandidates.addAll(searchCandidates("isrc:$isrc"))
+            if (allCandidates.isEmpty()) {
+                allCandidates.addAll(searchCandidates(isrc))
             }
+        }
+        if (allCandidates.isEmpty() && query.isNotEmpty()) {
+            allCandidates.addAll(searchCandidates(query))
         }
 
         val scoredCandidates = allCandidates.mapNotNull { candidate ->
