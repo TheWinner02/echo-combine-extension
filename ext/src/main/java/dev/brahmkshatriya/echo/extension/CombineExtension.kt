@@ -260,6 +260,12 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             result.add(metaExt)
         }
 
+        for (ext in exts) {
+            if (result.none { it.id == ext.id }) {
+                result.add(ext)
+            }
+        }
+
         return result.distinctBy { it.id }
     }
 
@@ -400,16 +406,18 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
         val query = "${metaTrack.title} $artistName".trim()
         if (query.isEmpty() && isrc.isEmpty()) return null
 
-        // 1. Direct ISRC lookup via TrackClient if supported
-        if (isrc.isNotEmpty()) {
+        val isYouTube = streamExt.id.contains("youtube", ignoreCase = true)
+
+        // 1. Direct ISRC lookup via TrackClient if supported (not for YouTube Music)
+        if (isrc.isNotEmpty() && !isYouTube) {
             val direct = try {
                 withTimeoutOrNull(4000) {
                     trackClient.loadTrack(Track(id = "", title = metaTrack.title, isrc = isrc), false)
                 }
             } catch (_: Throwable) { null }
 
-            if (direct != null && direct.streamables.isNotEmpty()) {
-                val cleanId = direct.id.ifEmpty { isrc }
+            if (direct != null && direct.id.isNotBlank() && direct.streamables.isNotEmpty()) {
+                val cleanId = direct.id
                 return direct.copy(streamables = direct.streamables.map { s ->
                     val existingExtras = s.extras
                     val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
@@ -452,30 +460,32 @@ class CombineExtension : ExtensionClient, MusicExtensionsProvider, GlobalSetting
             return candidates
         }
 
-        val allCandidates = mutableListOf<Track>()
-        if (isrc.isNotEmpty()) {
-            allCandidates.addAll(searchCandidates("isrc:$isrc"))
-            if (allCandidates.isEmpty()) {
-                allCandidates.addAll(searchCandidates(isrc))
-            }
-        }
-        if (allCandidates.isEmpty() && query.isNotEmpty()) {
-            allCandidates.addAll(searchCandidates(query))
+        var scoredCandidates = emptyList<Pair<Track, Double>>()
+        if (isrc.isNotEmpty() && !isYouTube) {
+            val isrcCandidates = searchCandidates("isrc:$isrc").ifEmpty { searchCandidates(isrc) }
+            scoredCandidates = isrcCandidates.mapNotNull { candidate ->
+                val score = scoreMatch(metaTrack, candidate)
+                if (score > 30.0) candidate to score else null
+            }.sortedByDescending { it.second }
         }
 
-        val scoredCandidates = allCandidates.mapNotNull { candidate ->
-            val score = scoreMatch(metaTrack, candidate)
-            if (score > 30.0) candidate to score else null
-        }.sortedByDescending { it.second }
+        if (scoredCandidates.isEmpty() && query.isNotEmpty()) {
+            val queryCandidates = searchCandidates(query)
+            scoredCandidates = queryCandidates.mapNotNull { candidate ->
+                val score = scoreMatch(metaTrack, candidate)
+                if (score > 30.0) candidate to score else null
+            }.sortedByDescending { it.second }
+        }
 
         for ((candidate, _) in scoredCandidates) {
+            if (candidate.id.isBlank()) continue
             val loaded = try {
                 withTimeoutOrNull(5000) {
                     trackClient.loadTrack(candidate, false)
                 }
             } catch (_: Throwable) { null }
 
-            if (loaded != null && loaded.streamables.isNotEmpty()) {
+            if (loaded != null && loaded.id.isNotBlank() && loaded.streamables.isNotEmpty()) {
                 return loaded.copy(streamables = loaded.streamables.map { s ->
                     val existingExtras = s.extras
                     val updatedExtras = if (existingExtras.containsKey("stream_ext_id")) existingExtras else existingExtras + mapOf("stream_ext_id" to streamExt.id)
