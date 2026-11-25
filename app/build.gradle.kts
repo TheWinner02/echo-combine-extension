@@ -1,6 +1,5 @@
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
 }
 
 dependencies {
@@ -85,7 +84,7 @@ android {
     }
 
     buildTypes {
-        all {
+        release {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(
