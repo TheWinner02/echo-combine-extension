@@ -271,7 +271,7 @@ class ExtensionUnitTest {
         val settingsBefore = extension.getSettingItems()
         val manageBefore = settingsBefore.filterIsInstance<SettingOnClick>().find { it.key == "manage_hidden_tracks" }
         assertNotNull(manageBefore)
-        assertEquals("Nessun brano nascosto", manageBefore!!.summary)
+        assertEquals("No hidden tracks • Tap to manage", manageBefore!!.summary)
 
         extension.hideItem(track, true)
         assertTrue(extension.isItemHidden(track))
